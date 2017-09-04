@@ -4,13 +4,18 @@ use std::marker::PhantomData;
 
 use std::iter::IntoIterator;
 
+use std::slice;
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 
 use errors::*;
 
-use sys::{self, jvalue, jint, jsize, jbyte, jboolean, jbyteArray};
-use std::os::raw::c_char;
+use sys::{self, jvalue, jint, jlong, jsize, jbyte, jboolean, jbyteArray};
+use std::os::raw::{c_char, c_void};
+use std::ptr::null_mut;
+
+use wrapper::JavaVM;
 
 use strings::JNIString;
 use strings::JavaStr;
@@ -19,6 +24,7 @@ use objects::JMap;
 use objects::JValue;
 use objects::JClass;
 use objects::JObject;
+use objects::JByteBuffer;
 use objects::JString;
 use objects::JThrowable;
 use objects::JMethodID;
@@ -49,6 +55,7 @@ use signature::Primitive;
 /// applicable, the null error is changed to a more applicable error type, such
 /// as `MethodNotFound`.
 #[repr(C)]
+#[derive(Debug, Clone)]
 pub struct JNIEnv<'a> {
     internal: *mut sys::JNIEnv,
     lifetime: PhantomData<&'a ()>,
@@ -62,6 +69,65 @@ impl<'a> From<*mut sys::JNIEnv> for JNIEnv<'a> {
         }
     }
 }
+
+/// cache class for jni multithreading support of android ([see
+/// android doc](https://developer.android.com/training/articles/perf-jni.html#faq_FindClass))
+///
+/// Example
+/// cache your jvm and needed classes in the thread before new thread is created:
+/// ```rust,ignore
+/// let jvm = env.cache_java_vm().unwrap();
+/// let _ = env.find_class(CLASS_NAME);
+/// ```
+///
+/// use `JniCache::get_jvm()` to get cached jvm afterwards
+/// `find_class` calls afterwards will use the cached class
+pub struct JniCache {
+    /// class map
+    class_map: Option<HashMap<String, JClass<'static>>>,
+    /// jvm
+    pub jvm: Option<JavaVM<'static>>,
+}
+
+impl JniCache {
+    /// cache a class
+    pub fn cache_class(&mut self, name: String, java_class: JClass<'static>) {
+        if let Some(ref mut class_map) = self.class_map {
+            class_map.insert(name, java_class);
+            debug!("JNI_CACHE cache_class class_map: {:?}, java_class: {:?}", class_map, java_class);
+        } else {
+            self.class_map = Some(HashMap::new());
+        }
+
+    }
+
+    /// get class from cache
+    pub fn get_class(&mut self, name: String) -> Option<&JClass<'static>> {
+        if let Some(ref class_map) = self.class_map {
+            debug!("JNI_CACHE get_class name: {:?}", name);
+            class_map.get(&name)
+        } else {
+            self.class_map = Some(HashMap::new());
+            None
+        }
+    }
+
+    /// get jvm from cache
+    pub fn get_jvm() -> Option<JavaVM<'static>> {
+        unsafe {
+            debug!("JNI_CACHE get_jvm: {:?}", JNI_CACHE.jvm);
+            JNI_CACHE.jvm
+        }
+    }
+
+    /// cache jvm
+    pub fn cache_jvm(&mut self, jvm: JavaVM<'static>) {
+        debug!("JNI_CACHE cache_jvm jvm: {:?}", jvm);
+        self.jvm = Some(jvm);
+    }
+}
+
+static mut JNI_CACHE: JniCache = JniCache {class_map: None, jvm: None};
 
 impl<'a> JNIEnv<'a> {
     /// Get the java version that we're being executed from. This is encoded and
@@ -98,7 +164,22 @@ impl<'a> JNIEnv<'a> {
         where S: Into<JNIString>
     {
         let name = name.into();
-        let class = jni_call!(self.internal, FindClass, name.as_ptr());
+        unsafe {
+            let java_class = JNI_CACHE.get_class(String::from(name.clone()));
+            debug!("find_class got cached class: {:?}", java_class);
+            if let Some(java_class) = java_class {
+                return Ok(*java_class)
+            } else {
+                error!("find_class failed name:{:?}", String::from(name.clone()));
+            }
+        }
+
+        let class: JClass<'static> = jni_call!(self.internal, FindClass, name.as_ptr());
+        let new_ref: JClass<'static> = jni_call!(self.internal, NewGlobalRef, class.into_inner());
+
+        unsafe {
+            JNI_CACHE.cache_class(String::from(name.clone()), new_ref);
+        }
         Ok(class)
     }
 
@@ -200,6 +281,47 @@ impl<'a> JNIEnv<'a> {
         Ok(check)
     }
 
+    /// Create a new instance of a direct java.nio.ByteBuffer.
+    pub fn new_direct_byte_buffer(&self,
+                                  data: &mut [u8])
+                                  -> Result<JByteBuffer> {
+        let obj = unsafe {
+            jni_unchecked!(self.internal,
+                           NewDirectByteBuffer,
+                           data.as_mut_ptr() as *mut c_void,
+                           data.len() as jlong)
+        };
+        Ok(JByteBuffer::from(obj))
+    }
+
+    /// Returns the starting address of the memory of the direct
+    /// java.nio.ByteBuffer.
+    pub fn get_direct_buffer_address(&self,
+                                     buf: JByteBuffer)
+                                     -> Result<&mut [u8]> {
+        let ptr: *mut c_void = unsafe {
+            jni_unchecked!(self.internal,
+                           GetDirectBufferAddress,
+                           buf.into_inner())
+        };
+        let capacity = self.get_direct_buffer_capacity(buf)?;
+        unsafe {
+            Ok(slice::from_raw_parts_mut(ptr as *mut u8, capacity as usize))
+        }
+    }
+
+    /// Returns the capacity of the direct java.nio.ByteBuffer.
+    pub fn get_direct_buffer_capacity(&self,
+                                      buf: JByteBuffer)
+                                      -> Result<jlong> {
+        let capacity = unsafe {
+            jni_unchecked!(self.internal,
+                           GetDirectBufferCapacity,
+                           buf.into_inner())
+        };
+        Ok(capacity)
+    }
+
     /// Turns an object into a global ref. This has the benefit of removing the
     /// lifetime bounds since it's guaranteed to not get GC'd by java. It
     /// releases the GC pin upon being dropped.
@@ -218,7 +340,7 @@ impl<'a> JNIEnv<'a> {
     }
 
     #[allow(dead_code)]
-    fn delete_local_ref(&self, obj: JObject) -> Result<()> {
+    pub fn delete_local_ref(&self, obj: JObject) -> Result<()> {
         non_null!(obj, "delete_local_ref obj argument");
         Ok(unsafe {
                jni_unchecked!(self.internal, DeleteLocalRef, obj.into_inner());
@@ -962,6 +1084,29 @@ impl<'a> JNIEnv<'a> {
                life: Default::default(),
            })
     }
+
+    /// get JavaVM and cache it
+    pub fn cache_java_vm(&self) -> Result<JavaVM> {
+        let jvm = JniCache::get_jvm();
+        if let Some(jvm) = jvm {
+            return Ok(jvm);
+        }
+
+        let mut ptr: *mut sys::JavaVM = null_mut();
+        let pptr = &mut ptr as *mut *mut sys::JavaVM;
+        unsafe {
+            let status = jni_unchecked!(self.internal, GetJavaVM, pptr);
+            if status != sys::JNI_OK {
+                return Err(ErrorKind::JavaException.into());
+            }
+        }
+
+        let jvm = JavaVM::from(ptr as *mut sys::JavaVM);
+        unsafe {
+            JNI_CACHE.cache_jvm(jvm);
+        }
+        Ok(jvm)
+    }
 }
 
 /// Guard for a lock on a java object. This gets returned from the `lock_obj`
@@ -985,4 +1130,3 @@ impl<'a> Drop for MonitorGuard<'a> {
         }
     }
 }
-
